@@ -33,3 +33,9 @@ def create_order():
     }
     order = client.order.create(data=DATA)
     return jsonify(order)
+
+
+@payment_bp.route('/handle-order-callback', methods=["GET", "POST"])
+def handle_order_callback():
+    print(request.query_string)
+    return "SUCCESS"
