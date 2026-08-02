@@ -7,6 +7,7 @@
 - webhook: signature-checked payment.captured handler — the authoritative,
   idempotent path (browsers close mid-checkout; Razorpay retries webhooks).
 """
+import json
 import os
 
 import razorpay
@@ -14,7 +15,8 @@ from flask import Blueprint, request, jsonify, g
 
 from services.get_kolkata_timestamp import get_kolkata_timestamp
 from services.supabase_auth import require_supabase_user
-from services.pricing import compute_discount
+from services.pricing import compute_price
+from services.grants import build_grant_items, NEET_TENANT_ID, NEET_SCHOOL_ID
 from services import db
 
 payment_bp = Blueprint("payment", __name__)
@@ -32,7 +34,8 @@ def create_order():
         return jsonify({"error": "plan_id is required"}), 400
 
     plan = db.fetch_one(
-        "select id, title, amount_paise, grants from neet_plans where id = %s and active",
+        "select id, title, amount_paise, sale_amount_paise, sale_ends_at, "
+        "gst_bps, grants, access_until from neet_plans where id = %s and active",
         (plan_id,),
     )
     if not plan:
@@ -44,12 +47,12 @@ def create_order():
         if promo is None:
             return jsonify({"error": "Invalid promo code"}), 400
 
-    final_paise, discount_paise, promo_err = compute_discount(plan, promo)
-    if promo_err:
-        return jsonify({"error": promo_err}), 400
+    price = compute_price(plan, promo)
+    if promo is not None and not price["promo_ok"]:
+        return jsonify({"error": price["promo_reason"]}), 400
 
     order = client.order.create(data={
-        "amount": final_paise,
+        "amount": price["total_paise"],
         "currency": "INR",
         "notes": {
             "user_id": g.user_id,
@@ -61,39 +64,70 @@ def create_order():
 
     db.execute(
         "insert into neet_orders (user_id, plan_id, amount_paise, list_amount_paise, "
-        "promo_code, discount_paise, razorpay_order_id) "
-        "values (%s, %s, %s, %s, %s, %s, %s)",
-        (g.user_id, plan["id"], final_paise, plan["amount_paise"],
-         promo_code, discount_paise, order["id"]),
+        "taxable_paise, gst_paise, promo_code, discount_paise, razorpay_order_id) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (g.user_id, plan["id"], price["total_paise"], price["list_paise"],
+         price["taxable_paise"], price["gst_paise"], promo_code,
+         price["promo_discount_paise"], order["id"]),
     )
 
     return jsonify({
         "order_id": order["id"],
-        "amount": final_paise,
+        "amount": price["total_paise"],
         "currency": "INR",
         "key_id": os.getenv("RAZORPAY_KEY_ID"),
         "plan_title": plan["title"],
+        "breakdown": {
+            "list_paise": price["list_paise"],
+            "discount_paise": price["promo_discount_paise"],
+            "taxable_paise": price["taxable_paise"],
+            "gst_paise": price["gst_paise"],
+            "total_paise": price["total_paise"],
+        },
     })
 
 
 def _grant(order):
-    """Mark an order paid and grant its entitlement. Idempotent: the status
-    guard stops double promo counting; the unique constraint stops double
-    entitlements."""
+    """Mark an order paid and append its products to users.active_products.
+
+    Idempotent twice over: the status guard stops double promo counting, and
+    the `source` check stops a webhook retry appending duplicate products.
+    """
     updated = db.execute(
         "update neet_orders set status = 'paid', paid_at = now(), razorpay_payment_id = %s "
-        "where razorpay_order_id = %s and status <> 'paid' returning id, user_id, plan_id, promo_code",
+        "where razorpay_order_id = %s and status <> 'paid' "
+        "returning id, user_id, plan_id, promo_code, amount_paise, created_at",
         (order["payment_id"], order["order_id"]),
     )
     if not updated:
         return  # already processed (verify + webhook both land here)
 
-    plan = db.fetch_one("select grants from neet_plans where id = %s", (updated["plan_id"],))
-    db.execute(
-        "insert into neet_entitlements (user_id, product, source) values (%s, %s, %s) "
-        "on conflict (user_id, product, source) do nothing",
-        (updated["user_id"], plan["grants"], f"razorpay:{order['payment_id']}"),
+    plan = db.fetch_one(
+        "select id, grants, access_until from neet_plans where id = %s",
+        (updated["plan_id"],),
     )
+    items = build_grant_items(plan, updated, order["payment_id"], updated["amount_paise"])
+
+    # The NEET buyer may have no legacy users row yet — create one keyed to
+    # their Supabase auth UUID.
+    db.execute(
+        "insert into users (user_id, tenant_id, school_id, user_type, status, active_products) "
+        "values (%s, %s, %s, 'neet_student', 'active', '[]'::jsonb) "
+        "on conflict (user_id) do nothing",
+        (updated["user_id"], NEET_TENANT_ID, NEET_SCHOOL_ID),
+    )
+
+    for item in items:
+        db.execute(
+            "update users set active_products = active_products || %s::jsonb, "
+            "updated_at = now() "
+            "where user_id = %s and not exists ("
+            "  select 1 from jsonb_array_elements(active_products) existing"
+            "  where existing->>'source' = %s and existing->>'product_name' = %s)",
+            (json.dumps([item]), updated["user_id"],
+             item["source"], item["product_name"]),
+        )
+
     if updated["promo_code"]:
         db.execute(
             "update neet_promo_codes set used_count = used_count + 1 where code = %s",
@@ -153,12 +187,14 @@ def webhook():
 @payment_bp.route("/my-entitlements", methods=["GET"])
 @require_supabase_user
 def my_entitlements():
-    with db.get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "select product from neet_entitlements where user_id = %s "
-                "and revoked_at is null and (expires_at is null or expires_at > now())",
-                (g.user_id,),
-            )
-            products = [r[0] for r in cur.fetchall()]
-    return jsonify({"entitlements": products})
+    row = db.fetch_one(
+        "select coalesce(jsonb_agg(item->>'product_name') filter ("
+        "  where item->>'revoked_at' is null"
+        "    and (item->>'expiration_date' is null"
+        "         or (item->>'expiration_date')::date >= current_date)"
+        "), '[]'::jsonb) as products "
+        "from users u, lateral jsonb_array_elements(u.active_products) item "
+        "where u.user_id = %s",
+        (g.user_id,),
+    )
+    return jsonify({"entitlements": (row or {}).get("products") or []})
