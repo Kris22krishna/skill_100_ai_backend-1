@@ -64,11 +64,11 @@ def create_order():
 
     db.execute(
         "insert into neet_orders (user_id, plan_id, amount_paise, list_amount_paise, "
-        "taxable_paise, gst_paise, promo_code, discount_paise, razorpay_order_id) "
-        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "taxable_paise, gst_paise, promo_code, discount_paise, razorpay_order_id, user_email) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (g.user_id, plan["id"], price["total_paise"], price["list_paise"],
          price["taxable_paise"], price["gst_paise"], promo_code,
-         price["promo_discount_paise"], order["id"]),
+         price["promo_discount_paise"], order["id"], g.user_email),
     )
 
     return jsonify({
@@ -102,7 +102,7 @@ def _grant(order):
         cur.execute(
             "update neet_orders set status = 'paid', paid_at = now(), razorpay_payment_id = %s "
             "where razorpay_order_id = %s and status <> 'paid' "
-            "returning id, user_id, plan_id, promo_code, amount_paise, created_at",
+            "returning id, user_id, plan_id, promo_code, amount_paise, created_at, user_email",
             (order["payment_id"], order["order_id"]),
         )
         updated = cur.fetchone()
@@ -118,12 +118,20 @@ def _grant(order):
                                   updated["amount_paise"])
 
         # The NEET buyer may have no legacy users row yet — create one keyed
-        # to their Supabase auth UUID.
+        # to their Supabase auth UUID. The email comes from neet_orders (set
+        # at create_order time, where the JWT is present), not from
+        # g.user_email: the webhook path calling this function has no
+        # authenticated request context at all. Without it,
+        # backend2's admin_create_grant/admin_revoke_grant — which resolve
+        # the target only by lower(email) = lower(:email) — 404 for every
+        # paying customer (C1). supabase_auth.py only decodes `email` off the
+        # verified JWT, so that's the only field available to store here;
+        # there is no name/display_name claim to carry through.
         cur.execute(
-            "insert into users (user_id, tenant_id, school_id, user_type, status, active_products) "
-            "values (%s, %s, %s, 'neet_student', 'active', '[]'::jsonb) "
+            "insert into users (user_id, tenant_id, school_id, user_type, status, email, active_products) "
+            "values (%s, %s, %s, 'neet_student', 'active', %s, '[]'::jsonb) "
             "on conflict (user_id) do nothing",
-            (updated["user_id"], NEET_TENANT_ID, NEET_SCHOOL_ID),
+            (updated["user_id"], NEET_TENANT_ID, NEET_SCHOOL_ID, updated["user_email"]),
         )
 
         for item in items:

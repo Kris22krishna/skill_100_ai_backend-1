@@ -19,7 +19,8 @@ import blueprints.payment_blueprint as pb
 ORDER_ROW = {"id": "b3f1c8a2-0000-0000-0000-000000000001",
              "user_id": "11111111-1111-1111-1111-111111111111",
              "plan_id": "neet-complete-2027", "promo_code": None,
-             "amount_paise": 2943156, "created_at": "2026-08-02"}
+             "amount_paise": 2943156, "created_at": "2026-08-02",
+             "user_email": "buyer@example.com"}
 PLAN_ROW = {"id": "neet-complete-2027", "access_until": "2027-05-31",
             "grants": ["neet-biology", "neet-physics", "neet-chemistry",
                        "neet-test-series"]}
@@ -29,10 +30,12 @@ class FakeCursor:
     def __init__(self, rows, fail_on_statement=None):
         self.rows = list(rows)
         self.statements = []
+        self.params = []
         self.fail_on_statement = fail_on_statement
 
     def execute(self, sql, params=None):
         self.statements.append(sql)
+        self.params.append(params)
         if self.fail_on_statement == len(self.statements):
             raise RuntimeError("connection dropped mid-grant")
 
@@ -91,6 +94,21 @@ def test_failure_midway_rolls_back_the_paid_flag_too(monkeypatch):
 
     assert "rollback" in outcome
     assert "commit" not in outcome
+
+
+def test_users_upsert_carries_the_buyer_email(monkeypatch):
+    """C1: backend2's admin_create_grant/admin_revoke_grant resolve the
+    target only by lower(email) = lower(:email). Without the buyer's email on
+    the users row, the Grants tab 404s for every paying customer."""
+    cur = FakeCursor([ORDER_ROW, PLAN_ROW])
+    install(monkeypatch, cur)
+
+    pb._grant({"order_id": "order_1", "payment_id": "pay_Nxyz"})
+
+    idx = next(i for i, s in enumerate(cur.statements)
+               if s.strip().startswith("insert into users"))
+    assert "email" in cur.statements[idx]
+    assert ORDER_ROW["user_email"] in cur.params[idx]
 
 
 def test_already_paid_order_is_a_no_op(monkeypatch):
