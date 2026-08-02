@@ -42,3 +42,17 @@ def execute(sql, params=None):
                 return cur.fetchone()
             except psycopg2.ProgrammingError:
                 return None
+
+
+@contextmanager
+def transaction():
+    """One connection, one commit, for operations that must be all-or-nothing.
+
+    execute() and fetch_one() each commit and close on their own, so a
+    sequence of them is a sequence of independent transactions — a failure
+    halfway leaves the earlier statements committed. Use this instead
+    whenever two or more statements must succeed or fail together.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            yield cur

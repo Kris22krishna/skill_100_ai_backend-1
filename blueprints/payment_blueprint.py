@@ -90,49 +90,58 @@ def create_order():
 def _grant(order):
     """Mark an order paid and append its products to users.active_products.
 
+    All of it runs in ONE transaction. If any step fails, the order is not
+    left marked paid, so Razorpay's retry re-runs the whole grant rather than
+    being turned away by the status guard with the buyer's products only
+    half-applied.
+
     Idempotent twice over: the status guard stops double promo counting, and
     the `source` check stops a webhook retry appending duplicate products.
     """
-    updated = db.execute(
-        "update neet_orders set status = 'paid', paid_at = now(), razorpay_payment_id = %s "
-        "where razorpay_order_id = %s and status <> 'paid' "
-        "returning id, user_id, plan_id, promo_code, amount_paise, created_at",
-        (order["payment_id"], order["order_id"]),
-    )
-    if not updated:
-        return  # already processed (verify + webhook both land here)
+    with db.transaction() as cur:
+        cur.execute(
+            "update neet_orders set status = 'paid', paid_at = now(), razorpay_payment_id = %s "
+            "where razorpay_order_id = %s and status <> 'paid' "
+            "returning id, user_id, plan_id, promo_code, amount_paise, created_at",
+            (order["payment_id"], order["order_id"]),
+        )
+        updated = cur.fetchone()
+        if not updated:
+            return  # already processed (verify + webhook both land here)
 
-    plan = db.fetch_one(
-        "select id, grants, access_until from neet_plans where id = %s",
-        (updated["plan_id"],),
-    )
-    items = build_grant_items(plan, updated, order["payment_id"], updated["amount_paise"])
+        cur.execute(
+            "select id, grants, access_until from neet_plans where id = %s",
+            (updated["plan_id"],),
+        )
+        plan = cur.fetchone()
+        items = build_grant_items(plan, updated, order["payment_id"],
+                                  updated["amount_paise"])
 
-    # The NEET buyer may have no legacy users row yet — create one keyed to
-    # their Supabase auth UUID.
-    db.execute(
-        "insert into users (user_id, tenant_id, school_id, user_type, status, active_products) "
-        "values (%s, %s, %s, 'neet_student', 'active', '[]'::jsonb) "
-        "on conflict (user_id) do nothing",
-        (updated["user_id"], NEET_TENANT_ID, NEET_SCHOOL_ID),
-    )
-
-    for item in items:
-        db.execute(
-            "update users set active_products = active_products || %s::jsonb, "
-            "updated_at = now() "
-            "where user_id = %s and not exists ("
-            "  select 1 from jsonb_array_elements(active_products) existing"
-            "  where existing->>'source' = %s and existing->>'product_name' = %s)",
-            (json.dumps([item]), updated["user_id"],
-             item["source"], item["product_name"]),
+        # The NEET buyer may have no legacy users row yet — create one keyed
+        # to their Supabase auth UUID.
+        cur.execute(
+            "insert into users (user_id, tenant_id, school_id, user_type, status, active_products) "
+            "values (%s, %s, %s, 'neet_student', 'active', '[]'::jsonb) "
+            "on conflict (user_id) do nothing",
+            (updated["user_id"], NEET_TENANT_ID, NEET_SCHOOL_ID),
         )
 
-    if updated["promo_code"]:
-        db.execute(
-            "update neet_promo_codes set used_count = used_count + 1 where code = %s",
-            (updated["promo_code"],),
-        )
+        for item in items:
+            cur.execute(
+                "update users set active_products = active_products || %s::jsonb, "
+                "updated_at = now() "
+                "where user_id = %s and not exists ("
+                "  select 1 from jsonb_array_elements(active_products) existing"
+                "  where existing->>'source' = %s and existing->>'product_name' = %s)",
+                (json.dumps([item]), updated["user_id"],
+                 item["source"], item["product_name"]),
+            )
+
+        if updated["promo_code"]:
+            cur.execute(
+                "update neet_promo_codes set used_count = used_count + 1 where code = %s",
+                (updated["promo_code"],),
+            )
 
 
 @payment_bp.route("/verify", methods=["POST"])
