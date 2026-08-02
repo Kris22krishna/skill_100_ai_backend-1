@@ -16,3 +16,7 @@ bruno_tests
 # uv package manager files (causes Vercel to use uv instead of pip, breaking deployment)
 uv.lock
 pyproject.toml
+# Secrets — never commit
+.env
+.env.*
+!.env.example
