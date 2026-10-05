@@ -7,6 +7,7 @@ from flask_cors import CORS
 load_dotenv()
 
 from blueprints.payment_blueprint import payment_bp  # noqa: E402 (needs env loaded)
+from blueprints.events_blueprint import events_bp  # noqa: E402
 
 app = Flask(__name__)
 
@@ -20,6 +21,8 @@ _origins = [o.strip() for o in os.getenv(
 CORS(app, origins=_origins, supports_credentials=True)
 
 app.register_blueprint(blueprint=payment_bp, url_prefix="/payment")
+# Server-to-server only (skill100-web's API routes); see events_blueprint.
+app.register_blueprint(blueprint=events_bp, url_prefix="/events")
 
 
 @app.route("/health")
